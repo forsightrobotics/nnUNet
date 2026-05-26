@@ -38,6 +38,12 @@ from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 
 
 class nnUNetPredictor(object):
+    # When True (default), 2D configs use the batched sliding-window fast path
+    # instead of the per-tile producer/queue loop. Override on an instance
+    # (e.g. ``predictor._use_batched_2d_path = False``) to force the legacy
+    # loop — useful for differential testing.
+    _use_batched_2d_path = True
+
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -590,6 +596,70 @@ class nnUNetPredictor(object):
         return prediction
 
     @torch.inference_mode()
+    def _internal_predict_2d_batched(self, data, slicers, predicted_logits,
+                                     n_predictions, gaussian, pbar):
+        """Batched 2D sliding-window forward.
+
+        Collapses the per-tile producer/queue loop into chunked batched calls
+        through ``_internal_maybe_mirror_and_predict``. Accumulator semantics
+        are identical to the legacy path:
+
+            predicted_logits[sl] += network(tile) * gaussian
+            n_predictions[sl[1:]] += gaussian
+
+        Chunk size is read from ``OCT3DSEG_2D_BATCH_CAP`` (default 64),
+        clamped to ``[1, len(slicers)]``. On ``torch.cuda.OutOfMemoryError``
+        the chunk is retried with ``batch_cap // 2`` — accumulators are
+        untouched at that point because the scatter only runs after a
+        successful forward (predict-then-scatter).
+        """
+        # Stack all per-tile inputs. For 2D slicers, data[s] is (C, ph, pw).
+        # data is already on results_device (== self.device under this gate),
+        # so no extra .to() is needed.
+        stacked = torch.stack([data[s] for s in slicers], dim=0)
+        n_tiles = stacked.shape[0]
+
+        cap_env = os.environ.get('OCT3DSEG_2D_BATCH_CAP', '64')
+        try:
+            cap = int(cap_env)
+        except (TypeError, ValueError):
+            cap = 64
+        if cap <= 0:
+            cap = 64
+        batch_cap = max(1, min(cap, n_tiles))
+
+        if self.verbose:
+            print(f'2D batched path: N={n_tiles} batch_cap={batch_cap}')
+
+        use_gauss = self.use_gaussian
+        scatter_device = predicted_logits.device
+
+        i = 0
+        while i < n_tiles:
+            chunk = stacked[i:i + batch_cap].contiguous()
+            try:
+                pred_chunk = self._internal_maybe_mirror_and_predict(chunk)
+            except torch.cuda.OutOfMemoryError:
+                if batch_cap == 1:
+                    raise
+                empty_cache(self.device)
+                batch_cap = max(1, batch_cap // 2)
+                continue  # retry the same i with a smaller chunk
+            pred_chunk = pred_chunk.to(scatter_device)
+
+            # Predict-then-scatter: accumulator only touched after success.
+            for k in range(pred_chunk.shape[0]):
+                sl = slicers[i + k]
+                row = pred_chunk[k]
+                if use_gauss:
+                    row = row * gaussian
+                predicted_logits[sl] += row
+                n_predictions[sl[1:]] += gaussian
+                pbar.update()
+
+            i += pred_chunk.shape[0]
+
+    @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
                                                        slicers,
@@ -610,9 +680,6 @@ class nnUNetPredictor(object):
             if self.verbose:
                 print(f'move image to device {results_device}')
             data = data.to(results_device)
-            queue = Queue(maxsize=2)
-            t = Thread(target=producer, args=(data, slicers, queue))
-            t.start()
 
             # preallocate arrays
             if self.verbose:
@@ -632,22 +699,39 @@ class nnUNetPredictor(object):
             if not self.allow_tqdm and self.verbose:
                 print(f'running prediction: {len(slicers)} steps')
 
-            with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
-                while True:
-                    item = queue.get()
-                    if item == 'end':
-                        queue.task_done()
-                        break
-                    workon, sl = item
-                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+            # 2D fast path: gated batched forward replaces the per-tile loop.
+            use_batched_2d = (
+                self._use_batched_2d_path
+                and len(self.configuration_manager.patch_size) == 2
+                and do_on_device
+                and data.ndim == 4
+                and len(slicers) > 0
+            )
 
-                    if self.use_gaussian:
-                        prediction *= gaussian
-                    predicted_logits[sl] += prediction
-                    n_predictions[sl[1:]] += gaussian
-                    queue.task_done()
-                    pbar.update()
-            queue.join()
+            with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
+                if use_batched_2d:
+                    self._internal_predict_2d_batched(
+                        data, slicers, predicted_logits, n_predictions, gaussian, pbar,
+                    )
+                else:
+                    queue = Queue(maxsize=2)
+                    t = Thread(target=producer, args=(data, slicers, queue))
+                    t.start()
+                    while True:
+                        item = queue.get()
+                        if item == 'end':
+                            queue.task_done()
+                            break
+                        workon, sl = item
+                        prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+
+                        if self.use_gaussian:
+                            prediction *= gaussian
+                        predicted_logits[sl] += prediction
+                        n_predictions[sl[1:]] += gaussian
+                        queue.task_done()
+                        pbar.update()
+                    queue.join()
 
             # predicted_logits /= n_predictions
             torch.div(predicted_logits, n_predictions, out=predicted_logits)
